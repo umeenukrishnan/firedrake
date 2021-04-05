@@ -1,8 +1,10 @@
 # cython: language_level=3
 
 # Utility functions common to all DMs used in Firedrake
+import functools
 import cython
 import numpy as np
+import firedrake
 from firedrake.petsc import PETSc
 from mpi4py import MPI
 from firedrake.utils import IntType, ScalarType
@@ -666,6 +668,174 @@ def quadrilateral_closure_ordering(PETSc.DM plex,
     return cell_closure
 
 
+cdef inline PetscInt _get_simplex_orientation(np.ndarray[PetscInt, ndim=2, mode="c"] cell_closure,
+                                              PetscInt cell,
+                                              PetscInt eStart,
+                                              PetscInt eEnd,
+                                              PetscInt *cone,
+                                              PetscInt coneSize):
+    cdef:
+        PetscInt k, n, e, q, o = 0, coneSize1 = coneSize
+        PetscInt *cone1 = NULL
+        PetscInt *inds = NULL
+
+    CHKERR(PetscMalloc1(coneSize, &cone1))
+    CHKERR(PetscMalloc1(coneSize, &inds))
+    for k in range(coneSize1):
+        cone1[k] = cone[k]
+    n = 0
+    for e in range(eStart, eEnd):
+        q = cell_closure[cell, e]
+        for k in range(coneSize1):
+            if q == cone1[k]:
+                inds[n] = k
+                n += 1
+                break
+        else:
+            continue
+        while k < coneSize1 - 1:
+            cone1[k] = cone1[k + 1]
+            k += 1
+        coneSize1 -= 1
+    assert n == coneSize
+    for k in range(n):
+        o += np.math.factorial(n - 1 - k) * inds[k]
+    CHKERR(PetscFree(cone1))
+    CHKERR(PetscFree(inds))
+    return o
+
+
+cdef inline PetscInt _ncr(PetscInt n , PetscInt r):
+    return np.math.factorial(n) // np.math.factorial(r) // np.math.factorial(n - r)
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+@cython.cdivision(True)
+def entity_orientations(mesh,
+                        np.ndarray[PetscInt, ndim=2, mode="c"] cell_closure):
+    """Compute entity orientations.
+
+    :arg mesh: The `MeshTopology` object encapsulating the mesh topology
+    :arg cell_closure: The two-dimensional array, each row of which contains
+        the closure of the associated cell
+
+    Each row of cell_closure must have been ordered to work well with
+    FInAT entity_dofs to create cell_node map (see `get_cell_nodes`).
+    """
+    cdef:
+        PETSc.DM dm
+        PetscInt dim, d, p, cell, e, eStart, eEnd, numCells, o
+        PetscInt *cone = NULL, c2, c3
+        PetscInt coneSize
+        PetscInt *ecounts = NULL, ecount
+        PetscInt *eoffsets = NULL, eoffset
+        PetscInt *inds = NULL
+        np.ndarray[PetscInt, ndim=2, mode="c"] entity_orientations
+
+    if type(mesh) is not firedrake.mesh.MeshTopology:
+        raise TypeError(f"Unexpected mesh type: {type(mesh)}")
+    dm = mesh.topology_dm
+    ufl_cell = mesh.ufl_cell()
+    dim = ufl_cell.topological_dimension()
+    numCells = cell_closure.shape[0]
+    entity_orientations = np.zeros_like(cell_closure)
+    if ufl_cell.is_simplex():
+        # FInAT reference triangle:
+        #
+        #   1
+        #   | \
+        #   5   3
+        #   | 6   \
+        #   0--4---2
+        #
+        CHKERR(PetscMalloc1(dim + 1, &ecounts))
+        CHKERR(PetscMalloc1(dim + 2, &eoffsets))
+        for d in range(dim + 1):
+            ecounts[d] = _ncr(dim + 1, d + 1)
+        eoffsets[0] = 0
+        for d in range(1, dim + 2):
+            eoffsets[d] = eoffsets[d - 1] + ecounts[d - 1]
+        for cell in range(numCells):
+            for d in range(dim + 1):
+                for e in range(eoffsets[d], eoffsets[d + 1]):
+                    if d == 0:
+                        o = 0
+                    else:
+                        p = cell_closure[cell, e]
+                        CHKERR(DMPlexGetConeSize(dm.dm, p, &coneSize))
+                        CHKERR(DMPlexGetCone(dm.dm, p, &cone))
+                        eStart = eoffsets[d - 1]
+                        eEnd = eoffsets[d]
+                        o = _get_simplex_orientation(cell_closure, cell, eStart, eEnd, cone, coneSize)
+                    entity_orientations[cell, e] = o
+        CHKERR(PetscFree(ecounts))
+        CHKERR(PetscFree(eoffsets))
+    elif ufl_cell.cellname() == "quadrilateral":
+        # FInAT reference quad
+        #
+        #   1---7---3
+        #   |       |
+        #   4   8   5
+        #   |       |
+        #   0---6---2
+        #
+        CHKERR(PetscMalloc1(3, &ecounts))
+        CHKERR(PetscMalloc1(4, &eoffsets))
+        CHKERR(PetscMalloc1(2, &inds))
+        for d, ecount in enumerate([4, 4, 1]):
+            ecounts[d] = ecount
+        for d, eoffset in enumerate([0, 4, 8, 9]):
+            eoffsets[d] = eoffset
+        for cell in range(numCells):
+            for d in range(dim + 1):
+                for e in range(eoffsets[d], eoffsets[d + 1]):
+                    if d == 0:
+                        o = 0
+                    elif d == 1:
+                        p = cell_closure[cell, e]
+                        CHKERR(DMPlexGetConeSize(dm.dm, p, &coneSize))
+                        CHKERR(DMPlexGetCone(dm.dm, p, &cone))
+                        eStart = eoffsets[d - 1]
+                        eEnd = eoffsets[d]
+                        o = _get_simplex_orientation(cell_closure, cell, eStart, eEnd, cone, coneSize)
+                    else:  # d == 2
+                        p = cell_closure[cell, e]
+                        CHKERR(DMPlexGetConeSize(dm.dm, p, &coneSize))
+                        CHKERR(DMPlexGetCone(dm.dm, p, &cone))
+                        eStart = eoffsets[d - 1]
+                        if cone[0] == cell_closure[cell, eStart]:
+                            inds[0] = 0
+                        elif cone[0] == cell_closure[cell, eStart + 1]:
+                            inds[0] = 1
+                        else:
+                            raise ValueError("cell_closure not correctly set up.")
+                        p = cell_closure[cell, eStart + 2]
+                        for c2 in range(coneSize):
+                            if cone[c2] == p:
+                                break
+                        else:
+                            raise ValueError("cell_closure not correctly set up.")
+                        p = cell_closure[cell, eStart + 3]
+                        for c3 in range(coneSize):
+                            if cone[c3] == p:
+                                break
+                        else:
+                            raise ValueError("cell_closure not correctly set up.")
+                        if c2 < c3:
+                            inds[1] = 0
+                        else:
+                            inds[1] = 1
+                        o = 2 * inds[0] + inds[1]
+                    entity_orientations[cell, e] = o
+        CHKERR(PetscFree(inds))
+        CHKERR(PetscFree(ecounts))
+        CHKERR(PetscFree(eoffsets))
+    else:
+        raise NotImplementedError(f"Unsupported cell type: {ufl_cell.cellname()}")
+    return entity_orientations
+
+
 @cython.boundscheck(False)
 @cython.wraparound(False)
 def create_section(mesh, nodes_per_entity, on_base=False):
@@ -743,6 +913,7 @@ def create_section(mesh, nodes_per_entity, on_base=False):
 def get_cell_nodes(mesh,
                    PETSc.Section global_numbering,
                    entity_dofs,
+                   entity_permutations,
                    np.ndarray[PetscInt, ndim=1, mode="c"] offset):
     """
     Builds the DoF mapping.
@@ -750,6 +921,7 @@ def get_cell_nodes(mesh,
     :arg mesh: The mesh
     :arg global_numbering: Section describing the global DoF numbering
     :arg entity_dofs: FInAT element entity dofs for the cell
+    :arg entity_permutations: FInAT element entity permutations for the cell
     :arg offset: offsets for each entity dof walking up a column.
 
     Preconditions: This function assumes that cell_closures contains mesh
@@ -759,21 +931,27 @@ def get_cell_nodes(mesh,
     dimension (1, 0) in the FInAT element.
     """
     cdef:
+        PETSc.DM dm
+        PETSc.Section cell_numbering
+        PetscInt nclosure, c, cStart, cEnd, cell, entity, i
+        PetscInt dofs_per_cell, ndofs, off, j, k, orient
         int *ceil_ndofs = NULL
         int *flat_index = NULL
-        PetscInt nclosure, dofs_per_cell
-        PetscInt c, i, j, k, cStart, cEnd, cell
-        PetscInt entity, ndofs, off
-        PETSc.Section cell_numbering
+        int *entity_dims = NULL
+        int *entity_nums = NULL
         np.ndarray[PetscInt, ndim=2, mode="c"] cell_nodes
         np.ndarray[PetscInt, ndim=2, mode="c"] layer_extents
         np.ndarray[PetscInt, ndim=2, mode="c"] cell_closures
-        bint variable
-        PETSc.DM dm
+        np.ndarray[PetscInt, ndim=2, mode="c"] entity_orientations
+        bint is_swarm, variable
 
     dm = mesh.topology_dm
+    is_swarm = type(dm) is PETSc.DMSwarm
     variable = mesh.variable_layers
     cell_closures = mesh.cell_closure
+    entity_orientations = mesh.entity_orientations
+    if not is_swarm and entity_orientations is None:
+        raise ValueError("entity_orientations can only be None for swarm meshes")
     if variable:
         layer_extents = mesh.layer_extents
         if offset is None:
@@ -784,6 +962,8 @@ def get_cell_nodes(mesh,
     # Extract ordering from FInAT element entity DoFs
     ndofs_list = []
     flat_index_list = []
+    dims_list = []
+    nums_list = []
 
     for dim in sorted(entity_dofs.keys()):
         for entity_num in xrange(len(entity_dofs[dim])):
@@ -791,6 +971,8 @@ def get_cell_nodes(mesh,
 
             ndofs_list.append(len(dofs))
             flat_index_list.extend(dofs)
+            dims_list.append(dim)
+            nums_list.append(entity_num)
 
     # Coerce lists into C arrays
     assert nclosure == len(ndofs_list)
@@ -798,9 +980,13 @@ def get_cell_nodes(mesh,
 
     CHKERR(PetscMalloc1(nclosure, &ceil_ndofs))
     CHKERR(PetscMalloc1(dofs_per_cell, &flat_index))
+    CHKERR(PetscMalloc1(nclosure, &entity_dims))
+    CHKERR(PetscMalloc1(nclosure, &entity_nums))
 
     for i in range(nclosure):
         ceil_ndofs[i] = ndofs_list[i]
+        entity_dims[i] = dims_list[i]
+        entity_nums[i] = nums_list[i]
     for i in range(dofs_per_cell):
         flat_index[i] = flat_index_list[i]
 
@@ -814,6 +1000,7 @@ def get_cell_nodes(mesh,
         CHKERR(PetscSectionGetOffset(cell_numbering.sec, c, &cell))
         for i in range(nclosure):
             entity = cell_closures[cell, i]
+            orient = 0 if is_swarm else entity_orientations[cell, i]
             CHKERR(PetscSectionGetDof(global_numbering.sec, entity, &ndofs))
             if ndofs > 0:
                 CHKERR(PetscSectionGetOffset(global_numbering.sec, entity, &off))
@@ -822,12 +1009,20 @@ def get_cell_nodes(mesh,
                 # we need to offset by the difference from the bottom.
                 if variable:
                     off += offset[flat_index[k]]*(layer_extents[c, 0] - layer_extents[entity, 0])
-                for j in range(ceil_ndofs[i]):
-                    cell_nodes[cell, flat_index[k]] = off + j
-                    k += 1
+                if entity_permutations is not None:
+                    for j in range(ceil_ndofs[i]):
+                        cell_nodes[cell, flat_index[k]] = off + entity_permutations[entity_dims[i]][entity_nums[i]][orient][j]
+                        k += 1
+                else:
+                    # FInAT element must eventually add entity_permutations() method
+                    for j in range(ceil_ndofs[i]):
+                        cell_nodes[cell, flat_index[k]] = off + j
+                        k += 1
 
     CHKERR(PetscFree(ceil_ndofs))
     CHKERR(PetscFree(flat_index))
+    CHKERR(PetscFree(entity_dims))
+    CHKERR(PetscFree(entity_nums))
     return cell_nodes
 
 
